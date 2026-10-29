@@ -1,20 +1,29 @@
+
 from pathlib import Path
 import sqlite3
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error
-import joblib
 
-# Locate inventory.db relative to this file so the script can run from any working directory.
+import joblib
+import numpy as np
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+# Define file paths
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR.parent / "database" / "inventory.db"
 MODEL_PATH = BASE_DIR / "demand_model.pkl"
 
-# Load inventory rows and join Product so Category is available as a feature.
-conn = sqlite3.connect(DB_PATH)
-df = pd.read_sql_query(
-    """
+if not DB_PATH.exists():
+    raise FileNotFoundError(f"Database not found: {DB_PATH}")
+
+# Load inventory data and join product categories
+query = """
     SELECT
         i.price,
         i.Discount,
@@ -24,43 +33,131 @@ df = pd.read_sql_query(
         i.Seasonality,
         i.Units_Sold,
         p.Category
-    FROM Inventory i
-    LEFT JOIN Product p ON i.Product_id = p.Product_id
-    """,
-    conn,
+    FROM Inventory AS i
+    LEFT JOIN Product AS p
+        ON i.Product_id = p.Product_id
+"""
+
+with sqlite3.connect(DB_PATH) as conn:
+    df = pd.read_sql_query(query, conn)
+
+if df.empty:
+    raise ValueError("No inventory records were found in the database.")
+
+print(f"Loaded {len(df)} inventory records.")
+
+# Define numeric features, categorical features, and target
+numeric_features = [
+    "price",
+    "Discount",
+    "Holiday_Promotion",
+    "Inventory_level",
+]
+
+categorical_features = [
+    "Weather_Condition",
+    "Seasonality",
+    "Category",
+]
+
+feature_columns = numeric_features + categorical_features
+target_column = "Units_Sold"
+
+# Convert numeric columns to valid numeric values
+for column in numeric_features + [target_column]:
+    df[column] = pd.to_numeric(df[column], errors="coerce")
+
+# Remove rows with missing or infinite target values
+df = df.dropna(subset=[target_column]).copy()
+df = df[np.isfinite(df[target_column])].copy()
+
+if df.empty:
+    raise ValueError("No valid Units_Sold values are available.")
+
+# Prepare input features and target values
+X = df[feature_columns].copy()
+y = df[target_column].copy()
+
+# Replace infinite feature values with missing values
+X[numeric_features] = X[numeric_features].replace(
+    [np.inf, -np.inf], np.nan
 )
-conn.close()
 
-# NOTE: Demand_Forecast is deliberately excluded. It correlates ~0.997 with Units_Sold,
-# meaning it's essentially a near-copy of the target rather than a genuine input signal.
-# Including it would make this a "correct an existing forecast" model, not a real
-# demand-forecasting model built from operational data.
-numeric_features = ["price", "Discount", "Holiday_Promotion", "Inventory_level"]
-categorical_features = ["Weather_Condition", "Seasonality", "Category"]
-
-# One-hot encode text columns so LinearRegression can use them.
-X = pd.get_dummies(
-    df[numeric_features + categorical_features],
-    columns=categorical_features,
-    drop_first=True,
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
 )
-Y = df["Units_Sold"]
 
-# Hold out 20% of rows so MAE is measured on unseen data.
-X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+print(f"Training records: {len(X_train)}")
+print(f"Testing records: {len(X_test)}")
 
-# Fit a linear model mapping the selected features to Units_Sold.
-model = LinearRegression()
-model.fit(X_train, Y_train)
+# Fill missing numeric values with medians
+numeric_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+])
 
-# Generate test-set predictions and report error against a naive baseline.
+# Fill missing categorical values and encode text columns
+categorical_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore")),
+])
+
+# Apply the appropriate preprocessing to each feature type
+preprocessor = ColumnTransformer([
+    ("numeric", numeric_pipeline, numeric_features),
+    ("categorical", categorical_pipeline, categorical_features),
+])
+
+# Create a Random Forest regression pipeline
+model = Pipeline([
+    ("preprocessor", preprocessor),
+    (
+        "regressor",
+        RandomForestRegressor(
+            n_estimators=300,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
+        ),
+    ),
+])
+
+# Train the model using historical inventory data
+print("\nTraining demand forecasting model...")
+model.fit(X_train, y_train)
+print("Training completed.")
+
+# Predict units sold for the test dataset
 predictions = model.predict(X_test)
-mae = mean_absolute_error(Y_test, predictions)
-baseline_mae = mean_absolute_error(Y_test, [Y_train.mean()] * len(Y_test))
 
-print(f"Mean Absolute Error: {mae:.2f}")
-print(f"Baseline MAE (predicting the average every time): {baseline_mae:.2f}")
+# Calculate the model's mean absolute error
+mae = mean_absolute_error(y_test, predictions)
 
-# Save the model and feature column order so future predictions use the same layout.
-joblib.dump({"model": model, "feature_columns": X.columns.tolist()}, MODEL_PATH)
-print(f"Model saved to {MODEL_PATH}")
+# Calculate baseline error by predicting average training sales
+baseline_predictions = np.full(len(y_test), y_train.mean())
+baseline_mae = mean_absolute_error(y_test, baseline_predictions)
+
+# Display model performance
+print("\nModel Evaluation")
+print(f"Model MAE: {mae:.2f}")
+print(f"Baseline MAE: {baseline_mae:.2f}")
+
+if baseline_mae > 0:
+    improvement = (
+        (baseline_mae - mae) / baseline_mae
+    ) * 100
+    print(f"Baseline MAE reduction: {improvement:.2f}%")
+
+if mae < baseline_mae:
+    print("Result: Model outperforms the baseline.")
+elif mae == baseline_mae:
+    print("Result: Model matches the baseline.")
+else:
+    print("Result: Model does not outperform the baseline.")
+
+# Save the trained model and preprocessing pipeline
+joblib.dump(model, MODEL_PATH)
+print(f"\nModel saved to {MODEL_PATH}")
