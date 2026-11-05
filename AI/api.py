@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, request
-from inventory_analysis import generate_reorder_suggestions
+from Inventory_Analysis import generate_reorder_suggestions
 
 app = Flask(__name__)
 
