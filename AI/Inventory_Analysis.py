@@ -53,18 +53,13 @@ def load_latest_inventory():
 
 def generate_reorder_suggestions():
     """Predict demand for the current snapshot and return reorder suggestions."""
-    saved = joblib.load(MODEL_PATH)
-    model = saved["model"]
-    feature_columns = saved["feature_columns"]
+    # Demand_Forecasting.py saves a sklearn Pipeline, not a dict.
+    model = joblib.load(MODEL_PATH)
 
     df = load_latest_inventory()
 
-    # Encode without drop_first, then reindex to the training columns so the layout always matches.
-    X = pd.get_dummies(
-        df[NUMERIC_FEATURES + CATEGORICAL_FEATURES],
-        columns=CATEGORICAL_FEATURES,
-    )
-    X = X.reindex(columns=feature_columns, fill_value=0)
+    # Pass the original columns; the pipeline handles imputation and one-hot encoding.
+    X = df[NUMERIC_FEATURES + CATEGORICAL_FEATURES]
 
     df["Predicted_Demand"] = model.predict(X).clip(min=0).round(1)
     df["Days_Of_Cover"] = (df["Inventory_level"] / df["Predicted_Demand"].clip(lower=1)).round(2)
